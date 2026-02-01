@@ -135,8 +135,12 @@ async function bash(command: string): Promise<string> {
         throw new Error(`Dangerous command: ${command}`);
     }
 
-    const result = await $`bash -c ${command}`.quiet();
-    return result.stdout.toString() || result.stderr.toString() || '';
+    try {
+        const result = await $`bash -c ${command}`.quiet();
+        return result.stdout.toString() || result.stderr.toString() || '';
+    } catch (error: any) {
+        throw new Error(`Error executing command: ${error.message}`);
+    }
 }
 
 async function write(path: string, content: string): Promise<string> {
@@ -153,13 +157,13 @@ async function read(path: string, lineLimit?: number): Promise<string> {
     }
     const content = await Bun.file(path).text();
     
-    if (lineLimit === undefined) {
-        return content;
-    }
-    
     const lines = content.split('\n');
-    const limitedLines = lines.slice(0, lineLimit);
-    return limitedLines.join('\n');
+    if (lineLimit !== undefined && lines.length > lineLimit) {
+        const limitedLines = lines.slice(0, lineLimit);
+        return limitedLines.join('\n') +
+                `\n\n... truncated (${lines.length - lineLimit} more lines)`;
+    }
+    return content;
 }
 
 async function edit(path: string, old_content: string, new_content: string): Promise<string> {
@@ -168,9 +172,14 @@ async function edit(path: string, old_content: string, new_content: string): Pro
     }
     const content = await Bun.file(path).text();
     
+    if (!content.includes(old_content)) {
+        throw new Error(`Pattern not found in ${path}`);
+    }
+    const occurrences = content.split(old_content).length - 1;
+    if (occurrences > 1) {
+        throw new Error(`Pattern appears ${occurrences} times, must be unique`);
+    }
     const newContent = content.replace(old_content, new_content);
-    // 文件内的部分文本替换
-    // 读取原有内容，使用 newContent（已替换 old_content 为 new_content），再写回文件
     await Bun.write(path, newContent);
     return `Edited ${path}`;
 }
@@ -208,6 +217,14 @@ async function agent(messages: ChatCompletionMessageParam[]): Promise<ChatComple
                 break;
             }
 
+            // Print assistant's text output if any
+            if (assistantMessage.content && typeof assistantMessage.content === 'string') {
+                console.log(`\n${assistantMessage.content}`);
+            }
+
+            const results: ChatCompletionMessageParam[] = [];
+
+            // Push assistant message first (contains tool_calls if any)
             messages.push(assistantMessage);
 
             // Use finish_reason to determine next action
@@ -222,31 +239,37 @@ async function agent(messages: ChatCompletionMessageParam[]): Promise<ChatComple
                         try {
                             // Parse the JSON arguments
                             const args = JSON.parse(functionToolCall.function.arguments);
-                            
-                            console.log(`\n🔧 Executing: ${toolName}(${JSON.stringify(args)})\n`);
+
+                            console.log(`🔧 ${toolName}(${JSON.stringify(args)})`);
                             const result = await executeCommand(toolName, args);
-                            console.log(result);
-                            
-                            messages.push({
+
+                            // Only print preview of result (max 200 chars)
+                            const preview = result.length > 200
+                                ? result.slice(0, 200) + '...'
+                                : result;
+                            console.log(`  ${preview}\n`);
+
+                            results.push({
                                 role: 'tool',
                                 content: result,
                                 tool_call_id: functionToolCall.id,
                             });
                         } catch (error: any) {
-                            console.error(`Error executing ${toolName}:`, error);
-                            messages.push({
+                            console.error(`  Error: ${error.message}\n`);
+                            results.push({
                                 role: 'tool',
                                 content: `Error: ${error.message}`,
                                 tool_call_id: functionToolCall.id,
                             });
                         }
                     }
+                    // Push all tool results
+                    messages.push(...results);
                     // Continue the loop to get the next response after tool execution
                     continue;
                 }
             } else if (finishReason === 'stop') {
                 // Model finished normally, we're done
-                // assistantMessage is already in messages, no need to push again
                 break;
             } else if (finishReason === 'length') {
                 // Hit token limit, warn and break
@@ -274,25 +297,64 @@ async function agent(messages: ChatCompletionMessageParam[]): Promise<ChatComple
 }
 
 async function main() {
-    let args = process.argv.slice(2);
-    let prompt = '';
+    // 处理命令行参数模式（单次执行）
+    const args = process.argv.slice(2);
     if (args.length > 0) {
-        prompt = args.join(' ');
-    } else {
-        const inquirer = (await import('inquirer')).default;
-        const result = await inquirer.prompt([
-            { type: 'input', name: 'prompt', message: 'What would you like me to do?' },
-        ]);
-        prompt = result.prompt;
+        const prompt = args.join(' ');
+        const history: ChatCompletionMessageParam[] = [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: prompt },
+        ];
+        await agent(history);
+        return;  // 单次模式，执行完退出
     }
 
+    // REPL (Read-Eval-Print-Loop) 模式（连续对话）
+    console.log(`\n🤖 Mini Claude Code v1 - ${WORKSPACE_DIR}`);
+    console.log(`Type 'exit' to quit.\n`);
+
+    const inquirer = (await import('inquirer')).default;
     const history: ChatCompletionMessageParam[] = [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: prompt },
     ];
 
-    // agent() mutates the messages array in place, so we pass history directly
-    await agent(history);
+
+    while (true) {
+        try {
+            const { prompt } = await inquirer.prompt([
+                {
+                    type: 'input',
+                    name: 'prompt',
+                    message: 'You:',
+                },
+            ]);
+
+            // 检查退出命令
+            if (!prompt || ['exit', 'quit', 'q'].includes(prompt.toLowerCase().trim())) {
+                console.log('\nGoodbye! 👋\n');
+                break;
+            }
+
+            // 添加用户消息到历史
+            history.push({
+                role: 'user',
+                content: prompt,
+            });
+
+            try {
+                // 运行 agent（会修改 history）
+                await agent(history);
+            } catch (error: any) {
+                console.error(`\n❌ Error: ${error.message}\n`);
+            }
+
+            console.log();  // 空行分隔每轮对话
+        } catch (error) {
+            // Ctrl+C 或其他中断
+            console.log('\nGoodbye! 👋\n');
+            break;
+        }
+    }
 }
 
-main();
+main().catch(console.error);
