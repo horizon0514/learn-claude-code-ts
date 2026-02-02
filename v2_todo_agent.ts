@@ -70,6 +70,11 @@ Rules:
 - After finishing, summarize what changed.
 `
 
+// Shown at the start of conversation
+const INITIAL_REMINDER = "Use TodoWrite for multi-step tasks"
+
+// Shown if model hasn't updated todos in a while
+const NAG_REMINDER = "10+ turns without todo update. Please update todos"
 
 /**
  * Key Design Decisions:
@@ -99,9 +104,6 @@ class TodoManager {
 
     update(todos: Todo[]) {
         // check if todos is valid
-        if (todos.length > 20) {
-            throw new Error('Too many todos');
-        }
         if (todos.some(todo => todo.status !== 'pending' && todo.status !== 'in_progress' && todo.status !== 'completed')) {
             throw new Error('Invalid todo status');
         }
@@ -110,6 +112,9 @@ class TodoManager {
         }
         if (todos.some(todo => todo.activeForm === '')) {
             throw new Error('Todo activeForm is required');
+        }
+        if (todos.length > 20) {
+            throw new Error('Too many todos');
         }
         // check if there is only one in_progress todo
         if (todos.filter(todo => todo.status === 'in_progress').length > 1) {
@@ -126,12 +131,20 @@ class TodoManager {
         if(this.todos.length === 0) {
             return 'No todos';
         }
-        let result = '';
+        let result: string[] = [];
         for (const todo of this.todos) {
-            result += `[${todo.status === 'in_progress' ? '>' : todo.status === 'completed' ? 'x' : ' '}] ${todo.content} ${todo.activeForm}\n`;
+            if (todo.status === 'in_progress') {
+                result.push(`[>] ${todo.content}`);
+            } else if (todo.status === 'completed') {
+                result.push(`[x] ${todo.content}`);
+            } else if (todo.status === 'pending') {
+                result.push(`[ ] ${todo.content}`);
+            } else {
+                // console.error(`Invalid todo status: ${todo.status}`);
+            }
         }
-        result += `\nTotal: ${this.todos.length}, In Progress: ${this.todos.filter(todo => todo.status === 'in_progress').length}, Completed: ${this.todos.filter(todo => todo.status === 'completed').length}`;
-        return result;
+        result.push(`Total: ${this.todos.length}, Completed: ${this.todos.filter(todo => todo.status === 'completed').length}`);
+        return result.join('\n');
     }
 }
 
@@ -318,6 +331,7 @@ async function executeCommand(command: string, args: Record<string, any>): Promi
 }
 
 async function agent(messages: ChatCompletionMessageParam[]): Promise<ChatCompletionMessageParam[]> {
+    let roundedNotUseTodo = 0
     while (true) {
         try {
             const response = await client.chat.completions.create({
@@ -345,6 +359,8 @@ async function agent(messages: ChatCompletionMessageParam[]): Promise<ChatComple
             // Push assistant message first (contains tool_calls if any)
             messages.push(assistantMessage);
 
+            let useTodo = false;
+
             // Use finish_reason to determine next action
             if (finishReason === 'tool_calls') {
                 // Model wants to call tools, process them
@@ -358,20 +374,24 @@ async function agent(messages: ChatCompletionMessageParam[]): Promise<ChatComple
                             // Parse the JSON arguments
                             const args = JSON.parse(functionToolCall.function.arguments);
 
-                            console.log(`🔧 ${toolName}(${JSON.stringify(args)})`);
+                            console.log(`🔧 ${toolName}`);
                             const result = await executeCommand(toolName, args);
 
                             // Only print preview of result (max 200 chars)
                             const preview = result.length > 200
                                 ? result.slice(0, 200) + '...'
                                 : result;
-                            console.log(`  ${preview}\n`);
+                            console.log(`${preview}\n`);
 
                             results.push({
                                 role: 'tool',
                                 content: result,
                                 tool_call_id: functionToolCall.id,
                             });
+
+                            if(toolName === 'todoWrite') {
+                                useTodo = true;
+                            }
                         } catch (error: any) {
                             console.error(`  Error: ${error.message}\n`);
                             results.push({
@@ -383,6 +403,15 @@ async function agent(messages: ChatCompletionMessageParam[]): Promise<ChatComple
                     }
                     // Push all tool results
                     messages.push(...results);
+                    // Count rounds without todoWrite and inject NAG if needed (before continue)
+                    if (!useTodo) {
+                        roundedNotUseTodo++;
+                    }
+                    if (roundedNotUseTodo > 10) {
+                        const nagContent = NAG_REMINDER + `\nCurrent todos:\n${todoManager.render()}`;
+                        messages.unshift({ role: 'user', content: nagContent });
+                        roundedNotUseTodo = 0;
+                    }
                     // Continue the loop to get the next response after tool execution
                     continue;
                 }
@@ -421,6 +450,7 @@ async function main() {
         const prompt = args.join(' ');
         const history: ChatCompletionMessageParam[] = [
             { role: 'system', content: systemPrompt },
+            { role: 'user', content: INITIAL_REMINDER },
             { role: 'user', content: prompt },
         ];
         await agent(history);
@@ -434,6 +464,7 @@ async function main() {
     const inquirer = (await import('inquirer')).default;
     const history: ChatCompletionMessageParam[] = [
         { role: 'system', content: systemPrompt },
+        { role: 'user', content: INITIAL_REMINDER },
     ];
 
 
